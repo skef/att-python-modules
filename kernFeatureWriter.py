@@ -43,10 +43,12 @@ This tool exports the kerning and groups data within a UFO to a
 '''
 
 import argparse
-import defcon
 import itertools
 import time
+import pprint
+from abc import abstractmethod
 
+import defcon
 from pathlib import Path
 
 
@@ -124,6 +126,130 @@ class Defaults(object):
         self.ignore_suffix = None
 
 
+class KernAdapter(object):
+    '''
+    Interface layer between underlying font source and the KerningSanitizer
+    '''
+
+    def has_data(self):
+        return self._has_data
+
+    @abstractmethod
+    def all_glyphs(self):
+        '''
+        Returns a set of the names of all glyphs in the sources
+        '''
+        pass
+
+    @abstractmethod
+    def glyph_order(self):
+        '''
+        Returns a dictionary of all the glyphs in the source font where
+        the key is the name and the value is the order of the glyph in
+        the font.
+        '''
+        pass
+
+    @abstractmethod
+    def groups(self):
+        '''
+        Returns a dict of all groups in the sources, with the name as a
+        key and a list of glyphs in the group as the value
+        '''
+        pass
+
+    @abstractmethod
+    def kerning(self):
+        '''
+        Returns a dict of all kerning pairs in the sources, with the
+        key being a tuple of (left, right) and the value being the kerning
+        value. The elements of the tuple can be glyph names or group names
+        '''
+        pass
+
+    @abstractmethod
+    def postscript_font_name(self):
+        '''
+        Returns the postscriptFontName stored in the sources, or None if
+        there is no name
+        '''
+        pass
+
+    @abstractmethod
+    def path(self):
+        '''
+        Returns path to the top of the source as a Path() object
+        '''
+        pass
+
+    @abstractmethod
+    def value_string(self, value, rtl=False):
+        '''
+        Returns the value as a string that can be used in a feature file.
+        When rtl is True the value will be for right-to-left use
+        '''
+        pass
+
+    @abstractmethod
+    def above_minimum(self, value, minimum):
+        '''
+        Returns True if the value is considered greater than minimum and
+        False otherwise. The value parameter must be from the kerning()
+        dictionary. The minimum parameter is an integer.
+        '''
+        pass
+
+
+class UFOKernAdapter(KernAdapter):
+    '''
+    Adapter for a single UFO
+    '''
+
+    def __init__(self, f):
+        self._has_data = True
+
+        if f:
+            if not f.kerning:
+                print('ERROR: The font has no kerning!')
+                self._has_data = False
+                return
+            if set(f.kerning.values()) == {0}:
+                print('ERROR: All kerning values are zero!')
+                self._has_data = False
+                return
+        self.f = f
+
+    def all_glyphs(self):
+        return set(self.f.keys())
+
+    def glyph_order(self):
+        return {gn: i for (i, gn) in enumerate(self.f.keys())}
+
+    def groups(self):
+        return self.f.groups
+
+    def kerning(self):
+        return self.f.kerning
+
+    def postscript_font_name(self):
+        try:
+            return self.f.info.postscriptFontName
+        except:
+            pass
+        return None
+
+    def path(self):
+        return Path(self.f.path)
+
+    def value_string(self, value, rtl=False):
+        if rtl:
+            return '<{0} 0 {0} 0>'.format(value)
+        else:
+            return str(value)
+
+    def above_minimum(self, value, minimum):
+        return abs(value) < minimum
+
 class KerningSanitizer(object):
     '''
     Sanitize UFO kerning and groups:
@@ -135,53 +261,62 @@ class KerningSanitizer(object):
 
     '''
 
-    def __init__(self, f):
-        self.f = f
+    def __init__(self, a):
+        self.a = a
         self.kerning = {}
         self.groups = {}
         self.reference_groups = {}
 
+        self.source_glyphs = self.a.all_glyphs()
+        self.source_glyph_order = self.a.glyph_order()
+        self.source_groups = self.a.groups()
+        self.source_kerning = self.a.kerning()
+
         # empty groups
         self.empty_groups = [
-            g for (g, gl) in self.f.groups.items() if not gl]
+            g for (g, gl) in self.source_groups.items() if not gl
+        ]
         # groups containing glyphs not in the UFO
         self.invalid_groups = [
-            g for (g, gl) in self.f.groups.items() if not
-            set(gl) <= set(self.f.keys())]
+            g for (g, gl) in self.source_groups.items() if not
+            set(gl) <= self.source_glyphs
+        ]
         # remaining groups
         self.valid_groups = [
-            g for g in self.f.groups.keys() if
+            g for g in self.source_groups.keys() if
             g not in [set(self.invalid_groups) | set(self.empty_groups)] and
             is_kerning_group(g)
         ]
-
-        self.valid_items = set(self.f.keys()) | set(self.valid_groups)
+        self.valid_items = self.source_glyphs | set(self.valid_groups)
         # pairs containing an invalid glyph or group
         self.invalid_pairs = [
-            pair for pair in self.f.kerning.keys() if not
-            set(pair) <= set(self.valid_items)]
-
+            pair for pair in self.source_kerning.keys() if not
+            set(pair) <= self.valid_items
+        ]
+        invalid_pair_set = set(self.invalid_pairs)
         self.kerning = {
-            pair: value for pair, value in self.f.kerning.items() if
-            pair not in self.invalid_pairs
+            pair: value for pair, value in self.source_kerning.items() if
+            pair not in invalid_pair_set
         }
         self.groups = {
-            gn: self.f.groups.get(gn) for gn in self.get_used_group_names()}
-
+            gn: self.source_groups.get(gn)
+            for gn in self.get_used_group_names(self.source_groups)
+        }
         self.reference_groups = {
-            gn: g_list for gn, g_list in self.f.groups.items() if not
-            is_kerning_group(gn)}
+            gn: g_set for gn, g_set in self.source_groups.items() if not
+            is_kerning_group(gn)
+        }
 
-    def get_used_group_names(self):
+    def get_used_group_names(self, groups):
         '''
         Return all groups which are actually used in kerning,
         by iterating through valid kerning pairs.
         '''
-        groups = list(self.f.groups.keys())
+        group_order = {gn: i for (i, gn) in enumerate(groups.keys())}
         used_groups = []
         for pair in self.kerning.keys():
             used_groups.extend([item for item in pair if is_group(item)])
-        return sorted(set(used_groups), key=groups.index)
+        return sorted(set(used_groups), key=lambda item: group_order[item])
 
     def report(self):
         '''
@@ -190,9 +325,10 @@ class KerningSanitizer(object):
         for group in self.empty_groups:
             print(f'group {group} is empty')
         for group in self.invalid_groups:
-            glyph_list = self.f.groups[group]
-            extraneous_glyphs = sorted(
-                set(glyph_list) - set(self.f.keys()), key=glyph_list.index)
+            glyph_order = {gn: i for (i, gn) in enumerate(groups.keys())}
+            glyph_set = self.source_groups[group]
+            extraneous_glyphs = sorted(glyph_set - self.source_glyphs,
+                key=lambda item: self.source_glyph_order[item])
             print(
                 f'group {group} contains extraneous glyph(s): '
                 f'[{", ".join(extraneous_glyphs)}]')
@@ -658,12 +794,14 @@ class MakeMeasuredSubtables(object):
 
 class run(object):
 
-    def __init__(self, font, args=None):
+    def __init__(self, adapter, args=None):
 
         if not args:
             args = Defaults()
 
-        self.f = font
+        assert adapter.has_data()
+
+        self.a = adapter
         self.minKern = args.min_value
         self.write_subtables = args.write_subtables
         self.subtable_size = args.subtable_size
@@ -672,31 +810,19 @@ class run(object):
         self.ignore_suffix = args.ignore_suffix
         self.trimmedPairs = 0
 
-        if self.f:
-            if not self.f.kerning:
-                print('ERROR: The font has no kerning!')
-                return
-            if set(self.f.kerning.values()) == {0}:
-                print('ERROR: All kerning values are zero!')
-                return
+        ks = KerningSanitizer(self.a)
+        ks.report()
+        kp = KernProcessor(
+            ks.groups, ks.kerning, ks.reference_groups,
+            self.dissolve_single, self.ignore_suffix)
 
-            ks = KerningSanitizer(self.f)
-            ks.report()
-            kp = KernProcessor(
-                ks.groups, ks.kerning, ks.reference_groups,
-                self.dissolve_single, self.ignore_suffix)
-
-            fea_data = self._make_fea_data(kp)
-            self.header = self.make_header(args)
-            output_path = Path(self.f.path).parent / args.output_name
-            self.write_fea_data(fea_data, output_path)
+        fea_data = self._make_fea_data(kp)
+        self.header = self.make_header(args)
+        output_path = self.a.path().parent / args.output_name
+        self.write_fea_data(fea_data, output_path)
 
     def make_header(self, args):
-        try:
-            ps_name = self.f.info.postscriptFontName
-        except Exception:
-            ps_name = None
-
+        ps_name = self.a.postscript_font_name()
         header = []
         if args.write_timestamp:
             header.append(f'# Created: {time.ctime()}')
@@ -714,17 +840,14 @@ class run(object):
         trimmed = 0
         for (item_1, item_2), value in pair_value_dict.items():
 
-            if rtl:
-                value_str = '<{0} 0 {0} 0>'.format(value)
-            else:
-                value_str = str(value)
+            value_str = self.a.value_string(value, rtl)
 
             posLine = f'pos {item_1} {item_2} {value_str};'
 
             if enum:
                 data.append('enum ' + posLine)
             else:
-                if abs(value) < minimum:
+                if self.a.above_minimum(value, minimum):
                     if self.write_trimmed_pairs:
                         data.append('# ' + posLine)
                         trimmed += 1
@@ -990,8 +1113,9 @@ def get_args(args=None):
 
 def main(test_args=None):
     args = get_args(test_args)
-    f = defcon.Font(args.input_file)
-    run(f, args)
+    a = UFOKernAdapter(defcon.Font(args.input_file))
+    if a.has_data():
+        run(a, args)
 
 
 if __name__ == '__main__':
