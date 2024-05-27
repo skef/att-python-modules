@@ -45,16 +45,22 @@ This tool exports the kerning and groups data within a UFO to a
 import argparse
 import itertools
 import time
-import pprint
 from abc import abstractmethod
-
-import defcon
+from collections import defaultdict
+from graphlib import TopologicalSorter, CycleError
 from pathlib import Path
 
+import defcon
+from fontTools.designspaceLib import (
+    DesignSpaceDocument,
+    DesignSpaceDocumentError,
+)
 
 # constants
 RTL_GROUP = 'RTL_KERNING'
 RTL_TAGS = ['_ARA', '_HEB', '_RTL']
+SHORTINSTNAMEKEY = 'adobe.shortInstanceName'
+GROUPSPLITSUFFIX = '_split'
 
 
 # helpers
@@ -96,6 +102,9 @@ class Defaults(object):
         # The default output filename
         self.output_name = 'kern.fea'
 
+        # The default name for the locations file
+        self.locations_name = 'locations.fea'
+
         # Default mimimum kerning value. This value is _inclusive_, which
         # means that pairs that equal this absolute value will not be
         # ignored/trimmed. Pairs in range of +/- value will be trimmed.
@@ -116,6 +125,9 @@ class Defaults(object):
         # Write time stamp in .fea file header?
         self.write_timestamp = False
 
+        # Do not write the locations file?
+        self.no_locations = False
+
         # Write single-element groups as glyphs?
         # (This has no influence on the output kerning data, but helps with
         # balancing subtables, and potentially makes the number of kerning
@@ -133,6 +145,19 @@ class KernAdapter(object):
 
     def has_data(self):
         return self._has_data
+
+    def has_locations(self):
+        '''
+        Returns true when the source is variable and false otherwise
+        '''
+        return False
+
+    def get_locations(self, designUnits = False):
+        '''
+        Returns a dictionary of location name to axis coordinates
+        '''
+        assert False
+        return {}
 
     @abstractmethod
     def all_glyphs(self):
@@ -191,7 +216,16 @@ class KernAdapter(object):
         pass
 
     @abstractmethod
-    def above_minimum(self, value, minimum):
+    def below_minimum(self, value, minimum):
+        '''
+        Returns True if the value is considered greater than minimum and
+        False otherwise. The value parameter must be from the kerning()
+        dictionary. The minimum parameter is an integer.
+        '''
+        pass
+
+    @abstractmethod
+    def value_is_zero(self, value):
         '''
         Returns True if the value is considered greater than minimum and
         False otherwise. The value parameter must be from the kerning()
@@ -247,8 +281,259 @@ class UFOKernAdapter(KernAdapter):
         else:
             return str(value)
 
-    def above_minimum(self, value, minimum):
+    def below_minimum(self, value, minimum):
         return abs(value) < minimum
+
+    def value_is_zero(self, value):
+        return value == 0
+
+class DesignspaceKernAdapter(KernAdapter):
+    '''
+    Adapter for a UFO-based variable font with a designspace file
+    '''
+
+    def __init__(self, dsDoc):
+        self._has_data = True
+
+        try:
+            self.fonts = dsDoc.loadSourceFonts(defcon.Font)
+        except DesignSpaceDocumentError as err:
+            print(err)
+            self._has_data = False
+
+        defaultSource = dsDoc.findDefault()
+        if defaultSource is not None:
+            self.defaultIndex = dsDoc.sources.index(defaultSource)
+        else:
+            print('ERROR: did not find source at default location')
+            self._has_data = False
+
+        default_location = dsDoc.sources[self.defaultIndex].location
+        self.defaultInstanceIndex = None
+        for i, inst in enumerate(dsDoc.instances):
+            if inst.designLocation == default_location:
+                self.defaultInstanceIndex = i
+                break
+
+        if self.defaultInstanceIndex is None:
+            print('could not find named instance for default location')
+
+        self.shortNames = []
+        for i, f in enumerate(self.fonts):
+            if i == self.defaultIndex:
+                self.shortNames.append(None)
+            elif SHORTINSTNAMEKEY in f.lib:
+                self.shortNames.append(f.lib[SHORTINSTNAMEKEY])
+            else:
+                self.shortNames.append(self.make_short_name(dsDoc, i))
+
+        self.dsDoc = dsDoc
+
+    def has_locations(self):
+        return True
+
+    def get_locations(self, designUnits = False):
+        tagDict = {}
+        for axisName in self.dsDoc.getAxisOrder():
+            tagDict[axisName] = self.dsDoc.getAxis(axisName).tag
+        locDict = {}
+        for i, ln in enumerate(self.shortNames):
+            if ln is None:
+                continue
+            axisLocs = self.dsDoc.sources[i].designLocation
+            if not designUnits:
+                axisLocs = self.dsDoc.map_backward(axisLocs)
+            axisLocsByTag = {}
+            for axisName, axisTag in tagDict.items():
+                axisLocsByTag[axisTag] = axisLocs[axisName]
+            locDict[ln] = axisLocsByTag
+        return locDict
+
+
+        return {}
+
+    def make_short_name(self, dsDoc, sourceIndex):
+        source = dsDoc.sources[sourceIndex]
+        location = source.location
+        anames = []
+        for an in dsDoc.getAxisOrder():
+            avstr = "%g" % location[an]
+            avstr = avstr.replace('.', 'p')
+            avstr = avstr.replace('-', 'n')
+            anames.append(avstr)
+        return '_'.join(anames)
+
+
+    def calc_glyph_data(self):
+        default_glyph_list = self.fonts[self.defaultIndex].keys()
+        default_glyph_set = set(default_glyph_list)
+
+        all_extra_glyphs = set()
+        self.glyph_sets = []
+        for i, f in enumerate(self.fonts):
+            if i == self.defaultIndex:
+                self.glyph_sets.append(default_glyph_set)
+                continue
+            current_glyph_set = set(f.keys())
+            self.glyph_sets.append(current_glyph_set)
+            extra_glyphs = current_glyph_set - default_glyph_set
+            if extra_glyphs:
+                source_name = self.dsDoc.sources[i].styleName
+                print(f'source {source_name} has these extra glyphs'
+                      f'not in default: [{", ".join(extra_glyphs)}]')
+                all_extra_glyphs |= extra_glyphs
+
+        self.glyph_set = default_glyph_set | all_extra_glyphs
+
+        self._glyph_order = {gn: i for (i, gn) in enumerate(default_glyph_list)}
+        if all_extra_glyphs:
+            extras_order = {gn: i for (i, gn) in
+                            enumerate(all_extra_glyphs,
+                                      start=default_glyph_set.size())}
+            self._glyph_order.update(extras_order)
+
+    def all_glyphs(self):
+        if not hasattr(self, 'glyph_set'):
+            self.calc_glyph_data()
+        return self.glyph_set
+
+    def glyph_order(self):
+        if not hasattr(self, '_glyph_order'):
+            self.calc_glyph_data()
+        return self._glyph_order
+
+    def groups(self):
+        if hasattr(self, '_groups'):
+            return self._groups
+        # Calculate partial orderings for groups across all fonts
+        group_orderings = defaultdict(lambda: defaultdict(set))
+        for i, f in enumerate(self.fonts):
+            for g, gl in f.groups.items():
+                ordering = group_orderings[g]
+                for j, gn in enumerate(gl):
+                    ordering[gn] |= set(gl[j+1:])
+
+        # Use the partial orderings to calculate a total ordering,
+        # or failing that use the order in which the glyphs were
+        # encountered
+        self._groups = {}
+        for g, ordering in group_orderings.items():
+            try:
+                ts = TopologicalSorter(ordering)
+                l = list(ts.static_order())
+            except CycleError as err:
+                print(f'glyphs in group {g} have different orderings across '
+                      'different sources, ordering cannot be preserved')
+                l = ordering.keys()
+            self._groups[g] = l
+
+        return self._groups
+
+    def kerning(self):
+        if hasattr(self, '_kerning'):
+            return self._kerning
+        if not hasattr(self, 'glyph_sets'):
+            self.calc_glyph_data()
+
+        # Collect full set of kerning pairs across sources
+        used_kerning_groups = set()
+        all_pairs = set()
+        for f in self.fonts:
+            for l, r in f.kerning.keys():
+                all_pairs.add((l, r))
+                if is_kerning_group(l):
+                    used_kerning_groups.add(l)
+                if is_kerning_group(r):
+                    used_kerning_groups.add(r)
+
+        # Find and split groups with mixed sparseness
+        groups = self.groups()
+        group_remap = {}
+        for g in used_kerning_groups:
+            sparse_patterns = defaultdict(list)
+            for gl in groups[g]:
+                pattern = (i for i, glyphs in enumerate(self.glyph_sets)
+                           if gl in glyphs)
+                assert pattern
+                sparse_patterns[frozenset(pattern)].append(gl)
+            if len(sparse_patterns) == 1:
+                # Nothing sparse or all glyphs sparse in the same way
+                continue
+            remap_list = []
+            for i, group_list in enumerate(sparse_patterns.values()):
+                new_group_name = g + GROUPSPLITSUFFIX + str(i)
+                groups[new_group_name] = group_list
+                remap_list.append(new_group_name)
+            del groups[g]
+            group_remap[g] = remap_list
+
+        # Build up variable kerning values using remapped groups
+        self._kerning = {}
+        for l, r in all_pairs:
+            pair = (l, r)
+            left_list = group_remap.get(l, [l])
+            right_list = group_remap.get(r, [r])
+            for lelem in left_list:
+                lglyph = groups.get(lelem, [lelem])[0]
+                for relem in right_list:
+                    value = []
+                    rglyph = groups.get(relem, [relem])[0]
+                    for i, f in enumerate(self.fonts):
+                        if (lglyph not in self.glyph_sets[i] or
+                            rglyph not in self.glyph_sets[i]):
+                            value.append(None)
+                            continue
+                        if pair in f.kerning:
+                            value.append(f.kerning[pair])
+                        else:
+                            value.append(0)
+                    self._kerning[(lelem, relem)] = value
+
+        return self._kerning
+
+    def postscript_font_name(self):
+        # Try the designspace document first
+        if self.defaultInstanceIndex is not None:
+            di = self.dsDoc.instances[self.defaultInstanceIndex] 
+            if hasattr(di, 'postScriptFontName'):
+                return di.postScriptFontName
+        # Then the UFO via defcon
+        try:
+            return self.fonts[self.defaultIndex].info.postscriptFontName
+        except:
+            pass
+        return None
+
+    def path(self):
+        return Path(self.dsDoc.path)
+
+    def value_string(self, value, rtl=False):
+        assert len(value) == len(self.fonts)
+        format_str =  '<{0} 0 {0} 0>' if rtl else '{0}'
+        vcopy = value.copy()
+        def_value = vcopy.pop(self.defaultIndex) 
+        if all(v is None or v == def_value for v in vcopy):
+            return format_str.format(def_value)
+        else:
+            value_strs = []
+            for i, v in enumerate(value):
+                if v is None:
+                    continue
+                vstr = format_str.format(v)
+                if i == self.defaultIndex:
+                    value_strs.append(vstr)
+                else:
+                    value_strs.append('@' + self.shortNames[i] + ':' + vstr)
+            return '(' + ' '.join(value_strs) + ')'
+
+    def below_minimum(self, value, minimum):
+        assert len(value) == len(self.fonts)
+        return all((v is None or abs(v) < minimum for v in value))
+
+    def value_is_zero(self, value):
+        assert len(value) == len(self.fonts)
+        return all((v is None or v == 0 for v in value))
+
 
 class KerningSanitizer(object):
     '''
@@ -349,10 +634,10 @@ class KerningSanitizer(object):
 
 class KernProcessor(object):
     def __init__(
-        self, groups=None, kerning=None, reference_groups=None,
+        self, adapter, groups=None, kerning=None, reference_groups=None,
         option_dissolve=False, ignore_suffix=None
     ):
-
+        self.a = adapter
         # kerning dicts containing pair-value combinations
         self.glyph_glyph = {}
         self.glyph_glyph_exceptions = {}
@@ -593,7 +878,7 @@ class KernProcessor(object):
                             self.glyph_glyph_exceptions[gr_pair] = gr_value
 
                 # skip the pair if the value is zero
-                if value == 0:
+                if self.a.value_is_zero(value):
                     self.pairs_unprocessed.append(pair)
                     continue
 
@@ -632,7 +917,7 @@ class KernProcessor(object):
                     r_group_glyphs = [item_r]
 
             # skip the pair if the value is zero
-            if value == 0:
+            if self.a.value_is_zero(value):
                 self.pairs_unprocessed.append(pair)
                 continue
 
@@ -813,13 +1098,16 @@ class run(object):
         ks = KerningSanitizer(self.a)
         ks.report()
         kp = KernProcessor(
-            ks.groups, ks.kerning, ks.reference_groups,
+            self.a, ks.groups, ks.kerning, ks.reference_groups,
             self.dissolve_single, self.ignore_suffix)
 
         fea_data = self._make_fea_data(kp)
         self.header = self.make_header(args)
         output_path = self.a.path().parent / args.output_name
         self.write_fea_data(fea_data, output_path)
+        if not args.no_locations and self.a.has_locations():
+            locations_path = self.a.path().parent / args.locations_name
+            self.write_locations(self.a, locations_path)
 
     def make_header(self, args):
         ps_name = self.a.postscript_font_name()
@@ -847,7 +1135,7 @@ class run(object):
             if enum:
                 data.append('enum ' + posLine)
             else:
-                if self.a.above_minimum(value, minimum):
+                if self.a.below_minimum(value, minimum):
                     if self.write_trimmed_pairs:
                         data.append('# ' + posLine)
                         trimmed += 1
@@ -1027,15 +1315,40 @@ class run(object):
 
         print(f'Output file written to {output_path}')
 
+    def write_locations(self, adapter, locations_path, designUnits = False):
+
+        print(f'Saving {locations_path.name} file...')
+
+        data = ['# Named locations', '']
+
+        unit = 'd' if designUnits else 'u'
+        for name, axisLocs in adapter.get_locations().items():
+            locationStr = ', '.join(('%s=%g%s' % (tag, val, unit) for
+                                     tag, val in axisLocs.items()))
+            data.append(f'locationDef {locationStr} @{name};')
+
+        with open(locations_path, 'w') as blob:
+            blob.write('\n'.join(data))
+            blob.write('\n')
+
+        print(f'Output file written to {locations_path}')
+
 
 def check_input_file(parser, file_name):
-    fn = Path(file_name)
-    if fn.suffix.lower() != '.ufo':
-        parser.error(f'{fn.name} is not a UFO file')
-    if not fn.exists():
-        parser.error(f'{fn.name} does not exist')
+    file_path = Path(file_name)
+    if file_path.suffix.lower() == '.ufo':
+        if not file_path.exists():
+            parser.error(f'{file_name} does not exist')
+        elif not file_path.is_dir():
+            parser.error(f'{file_name} is not a directory')
+    elif file_path.suffix.lower() == '.designspace':
+        if not file_path.exists():
+            parser.error(f'{file_name} does not exist')
+        elif not file_path.is_file():
+            parser.error(f'{file_name} is not a file')
+    else:
+        parser.error(f'Unrecognized input file type')
     return file_name
-
 
 def get_args(args=None):
 
@@ -1055,6 +1368,12 @@ def get_args(args=None):
         action='store',
         default=defaults.output_name,
         help='change the output file name')
+
+    parser.add_argument(
+        '-l', '--locations_name',
+        action='store',
+        default=defaults.locations_name,
+        help='change the locations file name (variable font only)')
 
     parser.add_argument(
         '-m', '--min_value',
@@ -1091,6 +1410,12 @@ def get_args(args=None):
         help='write time stamp in header of output file')
 
     parser.add_argument(
+        '--no_locations',
+        action='store_true',
+        default=defaults.write_timestamp,
+        help='Do not write locations file (variable font only)')
+
+    parser.add_argument(
         '--dissolve_single',
         action='store_true',
         default=defaults.dissolve_single,
@@ -1113,7 +1438,12 @@ def get_args(args=None):
 
 def main(test_args=None):
     args = get_args(test_args)
-    a = UFOKernAdapter(defcon.Font(args.input_file))
+    input_path = Path(args.input_file)
+    if input_path.is_file():
+        dsDoc = DesignSpaceDocument.fromfile(input_path)
+        a = DesignspaceKernAdapter(dsDoc)
+    else:
+        a = UFOKernAdapter(defcon.Font(args.input_file))
     if a.has_data():
         run(a, args)
 
