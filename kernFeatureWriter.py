@@ -119,6 +119,10 @@ class Defaults(object):
         # Write trimmed pairs to the output file (as comments).
         self.write_trimmed_pairs = False
 
+        # If variable, output user location values
+        # (default is design values)
+        self.user_values = False
+
         # Write subtables?
         self.write_subtables = False
 
@@ -152,7 +156,7 @@ class KernAdapter(object):
         '''
         return False
 
-    def get_locations(self, designUnits = False):
+    def get_locations(self, userUnits = False):
         '''
         Returns a dictionary of location name to axis coordinates
         '''
@@ -332,7 +336,7 @@ class DesignspaceKernAdapter(KernAdapter):
     def has_locations(self):
         return True
 
-    def get_locations(self, designUnits = False):
+    def get_locations(self, userUnits = False):
         tagDict = {}
         for axisName in self.dsDoc.getAxisOrder():
             tagDict[axisName] = self.dsDoc.getAxis(axisName).tag
@@ -341,7 +345,7 @@ class DesignspaceKernAdapter(KernAdapter):
             if ln is None:
                 continue
             axisLocs = self.dsDoc.sources[i].designLocation
-            if not designUnits:
+            if userUnits:
                 axisLocs = self.dsDoc.map_backward(axisLocs)
             axisLocsByTag = {}
             for axisName, axisTag in tagDict.items():
@@ -1107,7 +1111,7 @@ class run(object):
         self.write_fea_data(fea_data, output_path)
         if not args.no_locations and self.a.has_locations():
             locations_path = self.a.path().parent / args.locations_name
-            self.write_locations(self.a, locations_path)
+            self.write_locations(self.a, locations_path, args.user_values)
 
     def make_header(self, args):
         ps_name = self.a.postscript_font_name()
@@ -1315,14 +1319,14 @@ class run(object):
 
         print(f'Output file written to {output_path}')
 
-    def write_locations(self, adapter, locations_path, designUnits = False):
+    def write_locations(self, adapter, locations_path, userUnits = False):
 
         print(f'Saving {locations_path.name} file...')
 
         data = ['# Named locations', '']
 
-        unit = 'd' if designUnits else 'u'
-        for name, axisLocs in adapter.get_locations().items():
+        unit = 'u' if userUnits else 'd'
+        for name, axisLocs in adapter.get_locations(userUnits).items():
             locationStr = ', '.join(('%s=%g%s' % (tag, val, unit) for
                                      tag, val in axisLocs.items()))
             data.append(f'locationDef {locationStr} @{name};')
@@ -1412,8 +1416,15 @@ def get_args(args=None):
     parser.add_argument(
         '--no_locations',
         action='store_true',
-        default=defaults.write_timestamp,
+        default=defaults.no_locations,
         help='Do not write locations file (variable font only)')
+
+    parser.add_argument(
+        '-u', '--user_values',
+        action='store_true',
+        default=defaults.user_values,
+        help='For variable fonts, output user axis locations '
+             'rather than design axis locations')
 
     parser.add_argument(
         '--dissolve_single',
