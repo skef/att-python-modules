@@ -65,6 +65,8 @@ import sys
 from abc import abstractmethod
 from pathlib import Path
 from collections import defaultdict, namedtuple
+from graphlib import TopologicalSorter, CycleError
+from math import inf
 
 from defcon import Font
 from fontTools.designspaceLib import (
@@ -74,7 +76,8 @@ from fontTools.designspaceLib import (
 
 # ligature anchors end with 1ST, 2ND, 3RD, etc.
 ORDINALS = ['1ST', '2ND', '3RD'] + [f'{i}TH' for i in range(4, 10)]
-
+SHORTINSTNAMEKEY = 'adobe.shortInstanceName'
+NONEPOS = (-inf, -inf)
 
 class Defaults(object):
     """
@@ -100,11 +103,19 @@ class Defaults(object):
 
 
 def check_input_file(parser, file_name):
-    fn = Path(file_name)
-    if fn.suffix.lower() != '.ufo':
-        parser.error(f'{fn.name} is not a UFO file')
-    if not fn.exists():
-        parser.error(f'{fn.name} does not exist')
+    file_path = Path(file_name)
+    if file_path.suffix.lower() == '.ufo':
+        if not file_path.exists():
+            parser.error(f'{file_name} does not exist')
+        elif not file_path.is_dir():
+            parser.error(f'{file_name} is not a directory')
+    elif file_path.suffix.lower() == '.designspace':
+        if not file_path.exists():
+            parser.error(f'{file_name} does not exist')
+        elif not file_path.is_file():
+            parser.error(f'{file_name} is not a file')
+    else:
+        parser.error(f'Unrecognized input file type')
     return file_name
 
 
@@ -323,7 +334,8 @@ class UFOMarkAdapter(MarkAdapter):
         return d
 
     def glyph_order(self):
-        return {gn: i for (i, gn) in enumerate(self.f.keys())}
+        return {gn: i for (i, gn)
+                in enumerate(self.f.lib['public.glyphOrder'])}
 
     def groups(self):
         return self.f.groups
@@ -339,7 +351,173 @@ class UFOMarkAdapter(MarkAdapter):
         return f'{prefix}_{str_x}_{str_y}'
 
     def anchor_position_string(self, position):
-        return str(round(position[0])) + ' ' + str(round(position[1]))
+        return str(position[0]) + ' ' + str(position[1])
+
+
+class DesignspaceMarkAdapter(MarkAdapter):
+    '''
+    Adapter for a UFO-based variable font with a designspace file
+    '''
+
+    def __init__(self, dsDoc):
+        try:
+            self.fonts = dsDoc.loadSourceFonts(Font)
+        except DesignSpaceDocumentError as err:
+            sys.exit(err)
+
+        defaultSource = dsDoc.findDefault()
+        if defaultSource is not None:
+            self.defaultIndex = dsDoc.sources.index(defaultSource)
+        else:
+            sys.exit('Error: did not find source for default instance')
+
+        default_location = dsDoc.sources[self.defaultIndex].location
+        self.defaultInstanceIndex = None
+        for i, inst in enumerate(dsDoc.instances):
+            if inst.designLocation == default_location:
+                self.defaultInstanceIndex = i
+                break
+
+        if self.defaultInstanceIndex is None:
+            sys.exit('could not find named instance for default location')
+
+        self.shortNames = []
+        for i, f in enumerate(self.fonts):
+            if i == self.defaultIndex:
+                self.shortNames.append(None)
+            elif SHORTINSTNAMEKEY in f.lib:
+                self.shortNames.append(f.lib[SHORTINSTNAMEKEY])
+            else:
+                self.shortNames.append(self.make_short_name(dsDoc, i))
+
+        self.base_names = {}
+        self.dsDoc = dsDoc
+
+    def make_short_name(self, dsDoc, sourceIndex):
+        source = dsDoc.sources[sourceIndex]
+        location = source.location
+        anames = []
+        for an in dsDoc.getAxisOrder():
+            avstr = "%g" % location[an]
+            avstr = avstr.replace('.', 'p')
+            avstr = avstr.replace('-', 'n')
+            anames.append(avstr)
+        return '_'.join(anames)
+
+    def anchor_glyphs(self):
+        d = {}
+        f = self.fonts[self.defaultIndex]
+        for g in f:
+            position_map = {}
+            for a in g.anchors:
+                # Put the default instance position first so that the
+                # position sorting groups those together
+                position_map[a.name] = [(round(a.x), round(a.y))]
+            anchorNameSet = set(position_map.keys())
+            for i, source in enumerate(self.fonts):
+                if i == self.defaultIndex:
+                    continue
+                # If the glyph is absent put NONEPOS as the position
+                if g.name not in f:
+                    for plist in position_map.values():
+                        postions.append(NONEPOS)
+                    continue
+                foundNameSet = set()
+                for sga in source[g.name].anchors:
+                    if sga.name not in anchorNameSet:
+                        sys.exit(f'Error: glyph {g.name} has anchor {a.name} '
+                                f'in source of instance {self.shortNames[i]} '
+                                'but not in source of default instance')
+                    else:
+                        plist = position_map[sga.name]
+                        plist.append((round(sga.x), round(sga.y)))
+                        foundNameSet.add(sga.name)
+            missingNames = anchorNameSet - foundNameSet
+            if missingNames:
+                mnamestr = ', '.join(missingNames)
+                sys.exit(f'Error: glyph {g.name} has anchors {mnamestr} '
+                        'in source of default instance but not '
+                        f'source of instance {self.shortNames[i]}')
+            anchor_list = [AnchorInfo(a.name, tuple(position_map[a.name]))
+                           for a in g.anchors]
+            d[g.name] = GlyphAnchorInfo(g.name, g.width, anchor_list)
+        return d
+
+    def glyph_order(self):
+        # Use the glyph ordering in the source for the default instance
+        # as that should (always?) have all the glyphs
+        f = self.fonts[self.defaultIndex]
+        return {gn: i for (i, gn)
+                in enumerate(f.lib['public.glyphOrder'])}
+
+    def groups(self):
+        if hasattr(self, '_groups'):
+            return self._groups
+        # Calculate partial orderings for groups across all fonts
+        group_orderings = defaultdict(lambda: defaultdict(set))
+        for i, f in enumerate(self.fonts):
+            for g, gl in f.groups.items():
+                ordering = group_orderings[g]
+                for j, gn in enumerate(gl):
+                    ordering[gn] |= set(gl[j+1:])
+
+        # Use the partial orderings to calculate a total ordering,
+        # or failing that use the order in which the glyphs were
+        # encountered
+        self._groups = {}
+        for g, ordering in group_orderings.items():
+            try:
+                ts = TopologicalSorter(ordering)
+                l = list(ts.static_order())
+            except CycleError as err:
+                print(f'glyphs in group {g} have different orderings across '
+                      'different sources, ordering cannot be preserved')
+                l = ordering.keys()
+            self._groups[g] = l
+
+        return self._groups
+
+    def path(self):
+        return Path(self.dsDoc.path)
+
+    def unique_name(self, prefix, position):
+        # represent negative numbers with “n”, because minus is
+        # reserved for ranges:
+        str_x = str(position[0][0]).replace('-', 'n')
+        str_y = str(position[0][1]).replace('-', 'n')
+        # We choose names based on the position in the default instance
+        # but other position values could be different. A position is
+        # a tuple of two-tuples, one for each source, and are always the
+        # same length so they can be sorted and compared for identity.
+        # So all we need to do here is be careful not to hand out the
+        # same name for two different positions. Because unique_name
+        # will only be called with a prefix,position pair once, all we
+        # need to do is track how many we've handed out so far and add
+        # a unique suffix
+        base_name = f'{prefix}_{str_x}_{str_y}'
+        if base_name not in self.base_names:
+            self.base_names[base_name] = 0
+            return base_name
+        else:
+            rev = self.base_names[base_name] + 1
+            self.base_names[base_name] = rev
+            return base_name + '_' + str(rev)
+
+
+    def anchor_position_string(self, position):
+        assert len(position) == len(self.fonts)
+        def_pos = position[0]
+        def_str = str(def_pos[0]) + ' ' + str(def_pos[1])
+        if all(p == NONEPOS or p == def_pos for p in position):
+            return def_str
+
+        pos_strs = ['<' + def_str + '>']
+        for i, p in enumerate(position):
+            if i == self.defaultIndex or p == NONEPOS:
+                continue
+            pos_strs.append('@' + self.shortNames[i] + ':<' +
+                            str(p[0]) + ' ' + str(p[1]) + '>')
+        return '(' + ' '.join(pos_strs) + ')'
 
 
 class MarkFeatureWriter(object):
@@ -360,7 +538,12 @@ class MarkFeatureWriter(object):
         self.write_classes = args.write_classes
 
         if args.input_file:
-            adapter = UFOMarkAdapter(Path(args.input_file))
+            input_path = Path(args.input_file)
+            if input_path.is_file():
+                dsDoc = DesignSpaceDocument.fromfile(input_path)
+                adapter = DesignspaceMarkAdapter(dsDoc)
+            else:
+                adapter = UFOMarkAdapter(Path(args.input_file))
             self.run(adapter)
 
     def run(self, adapter):
