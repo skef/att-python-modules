@@ -219,9 +219,9 @@ class KernAdapter(object):
     def merge_values(self, v_fallback, v_exception):
         '''
         When v_exception is the value associated with a more specific
-        rule, and v_fallback is associated with a less specific matching
-        rule, returns a combined value for the exception filled in with
-        parts of the fallback as needed.
+        rule, and v_fallback is associated with a less specific but
+        matching rule, returns a combined value for the exception
+        filled in with parts of the fallback as needed.
         '''
         pass
 
@@ -298,10 +298,11 @@ class UFOKernAdapter(KernAdapter):
         return v_exception
 
     def value_string(self, value, rtl=False):
+        # adding 0 makes a -0.0 into a 0.0
         if rtl:
-            return '<{0:g} 0 {0:g} 0>'.format(value)
+            return '<{0:g} 0 {0:g} 0>'.format(value + 0)
         else:
-            return '{0:g}'.format(value)
+            return '{0:g}'.format(value + 0)
 
     def below_minimum(self, value, minimum):
         return abs(value) < minimum
@@ -501,6 +502,7 @@ class DesignspaceKernAdapter(KernAdapter):
                     value = []
                     rglyph = groups.get(relem, [relem])[0]
                     for i, f in enumerate(self.fonts):
+                        # Glyph wasn't present in font, set value to None
                         if (lglyph not in self.glyph_sets[i] or
                             rglyph not in self.glyph_sets[i]):
                             value.append(None)
@@ -508,8 +510,8 @@ class DesignspaceKernAdapter(KernAdapter):
                         if pair in f.kerning:
                             value.append(f.kerning[pair])
                         else:
-                            # Use -0 to differentiate from (potential)
-                            # explicit 0 kerning values in file
+                            # Use -0 to differentiate implicit 0 from
+                            # (potential) explicit 0 value in file
                             value.append(-0.0)
                     self._kerning[(lelem, relem)] = value
 
@@ -541,10 +543,11 @@ class DesignspaceKernAdapter(KernAdapter):
         return r
 
     def value_string(self, value, rtl=False):
+        # adding 0 makes a -0.0 into a 0.0
         assert len(value) == len(self.fonts)
         format_str =  '<{0:g} 0 {0:g} 0>' if rtl else '{0:g}'
         vcopy = value.copy()
-        def_value = vcopy.pop(self.defaultIndex) 
+        def_value = vcopy.pop(self.defaultIndex) + 0
         if all(v is None or v == def_value for v in vcopy):
             return format_str.format(def_value)
         else:
@@ -552,7 +555,7 @@ class DesignspaceKernAdapter(KernAdapter):
             for i, v in enumerate(value):
                 if v is None:
                     continue
-                vstr = format_str.format(v)
+                vstr = format_str.format(v + 0)
                 if i == self.defaultIndex:
                     value_strs.append(vstr)
                 else:
@@ -724,8 +727,12 @@ class KernProcessor(object):
         self.groups = groups
         self.kerning = kerning
         self.reference_groups = reference_groups
-        self.left_glyph_to_group = left_glyph_to_group
-        self.right_glyph_to_group = right_glyph_to_group
+        self.left_glyph_to_group = {
+            gl: self._remap_name(g) for gl, g in left_glyph_to_group.items()
+        }
+        self.right_glyph_to_group = {
+            gl: self._remap_name(g) for gl, g in right_glyph_to_group.items()
+        }
 
         self.ignore_suffix = ignore_suffix
 
