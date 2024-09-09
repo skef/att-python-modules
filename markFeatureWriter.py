@@ -45,8 +45,11 @@ Combining marks must be members of a `COMBINING_MARKS` reference group.
 #### Usage:
 ```zsh
 
-    # write a basic mark feature
+    # write a basic mark feature for a static font
     python markFeatureWriter.py font.ufo
+
+    # write a basic mark feature for a variable font
+    python markFeatureWriter.py font.designspace
 
     # write mark and mkmk feature files
     python markFeatureWriter.py -m font.ufo
@@ -123,16 +126,14 @@ def get_args(args=None):
 
     defaults = Defaults()
     parser = argparse.ArgumentParser(
-        description=(
-            'Mark Feature Writer'
-        ),
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     parser.add_argument(
         'input_file',
         type=lambda f: check_input_file(parser, f),
-        help='input UFO file')
+        help='input UFO or designspace file')
 
     parser.add_argument(
         '-t', '--trim_tags',
