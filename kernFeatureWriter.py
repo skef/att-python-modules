@@ -324,9 +324,14 @@ class DesignspaceKernAdapter(KernAdapter):
             print(err)
             self._has_data = False
 
+        for i, f in enumerate(self.fonts):
+            f.sourceIndex = i
+
         defaultSource = dsDoc.findDefault()
         if defaultSource is not None:
             self.defaultIndex = dsDoc.sources.index(defaultSource)
+            defaultFont = self.fonts.pop(self.defaultIndex)
+            self.fonts.insert(0, defaultFont)
         else:
             print('ERROR: did not find source at default location')
             self._has_data = False
@@ -341,14 +346,13 @@ class DesignspaceKernAdapter(KernAdapter):
         if self.defaultInstanceIndex is None:
             print('could not find named instance for default location')
 
-        self.shortNames = []
-        for i, f in enumerate(self.fonts):
-            if i == self.defaultIndex:
-                self.shortNames.append(None)
-            elif SHORTINSTNAMEKEY in f.lib:
+        self.shortNames = [None]
+        for f in self.fonts[1:]:
+            if SHORTINSTNAMEKEY in f.lib:
                 self.shortNames.append(f.lib[SHORTINSTNAMEKEY])
             else:
-                self.shortNames.append(self.make_short_name(dsDoc, i))
+                self.shortNames.append(self.make_short_name(dsDoc,
+                                                            f.sourceIndex))
 
         self.dsDoc = dsDoc
 
@@ -360,20 +364,17 @@ class DesignspaceKernAdapter(KernAdapter):
         for axisName in self.dsDoc.getAxisOrder():
             tagDict[axisName] = self.dsDoc.getAxis(axisName).tag
         locDict = {}
-        for i, ln in enumerate(self.shortNames):
-            if ln is None:
+        for i, f in enumerate(self.fonts):
+            if i == 0:
                 continue
-            axisLocs = self.dsDoc.sources[i].designLocation
+            axisLocs = self.dsDoc.sources[f.sourceIndex].designLocation
             if userUnits:
                 axisLocs = self.dsDoc.map_backward(axisLocs)
             axisLocsByTag = {}
             for axisName, axisTag in tagDict.items():
                 axisLocsByTag[axisTag] = axisLocs[axisName]
-            locDict[ln] = axisLocsByTag
+            locDict[self.shortNames[i]] = axisLocsByTag
         return locDict
-
-
-        return {}
 
     def make_short_name(self, dsDoc, sourceIndex):
         source = dsDoc.sources[sourceIndex]
@@ -384,24 +385,23 @@ class DesignspaceKernAdapter(KernAdapter):
             avstr = avstr.replace('.', 'p')
             avstr = avstr.replace('-', 'n')
             anames.append(avstr)
-        return '_'.join(anames)
+        return 'a' + '_'.join(anames)
 
 
     def calc_glyph_data(self):
-        default_glyph_list = self.fonts[self.defaultIndex].keys()
+        default_glyph_list = self.fonts[0].keys()
         default_glyph_set = set(default_glyph_list)
 
         all_extra_glyphs = set()
-        self.glyph_sets = []
+        self.glyph_sets = [default_glyph_set]
         for i, f in enumerate(self.fonts):
-            if i == self.defaultIndex:
-                self.glyph_sets.append(default_glyph_set)
+            if i == 0:
                 continue
             current_glyph_set = set(f.keys())
             self.glyph_sets.append(current_glyph_set)
             extra_glyphs = current_glyph_set - default_glyph_set
             if extra_glyphs:
-                source_name = self.dsDoc.sources[i].styleName
+                source_name = self.dsDoc.sources[f.sourceIndex].styleName
                 print(f'source {source_name} has these extra glyphs'
                       f'not in default: [{", ".join(extra_glyphs)}]')
                 all_extra_glyphs |= extra_glyphs
@@ -430,7 +430,7 @@ class DesignspaceKernAdapter(KernAdapter):
             return self._groups
         # Calculate partial orderings for groups across all fonts
         group_orderings = defaultdict(lambda: defaultdict(set))
-        for i, f in enumerate(self.fonts):
+        for f in self.fonts:
             for g, gl in f.groups.items():
                 ordering = group_orderings[g]
                 for j, gn in enumerate(gl):
@@ -525,7 +525,7 @@ class DesignspaceKernAdapter(KernAdapter):
                 return di.postScriptFontName
         # Then the UFO via defcon
         try:
-            return self.fonts[self.defaultIndex].info.postscriptFontName
+            return self.fonts[0].info.postscriptFontName
         except:
             pass
         return None
@@ -546,9 +546,8 @@ class DesignspaceKernAdapter(KernAdapter):
         # adding 0 makes a -0.0 into a 0.0
         assert len(value) == len(self.fonts)
         format_str =  '<{0:g} 0 {0:g} 0>' if rtl else '{0:g}'
-        vcopy = value.copy()
-        def_value = vcopy.pop(self.defaultIndex) + 0
-        if all(v is None or v == def_value for v in vcopy):
+        def_value = value[0] + 0
+        if all(v is None or v == def_value for v in value):
             return format_str.format(def_value)
         else:
             value_strs = []
@@ -556,7 +555,7 @@ class DesignspaceKernAdapter(KernAdapter):
                 if v is None:
                     continue
                 vstr = format_str.format(v + 0)
-                if i == self.defaultIndex:
+                if i == 0:
                     value_strs.append(vstr)
                 else:
                     value_strs.append('@' + self.shortNames[i] + ':' + vstr)

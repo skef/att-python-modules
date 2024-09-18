@@ -366,31 +366,25 @@ class DesignspaceMarkAdapter(MarkAdapter):
         except DesignSpaceDocumentError as err:
             sys.exit(err)
 
+        for i, f in enumerate(self.fonts):
+            f.sourceIndex = i
+
         defaultSource = dsDoc.findDefault()
         if defaultSource is not None:
-            self.defaultIndex = dsDoc.sources.index(defaultSource)
+            defaultIndex = dsDoc.sources.index(defaultSource)
+            default_font = self.fonts.pop(defaultIndex)
+            self.fonts.insert(0, default_font)
         else:
             sys.exit('Error: did not find source for default instance')
 
-        default_location = dsDoc.sources[self.defaultIndex].location
-        self.defaultInstanceIndex = None
-        for i, inst in enumerate(dsDoc.instances):
-            if inst.designLocation == default_location:
-                self.defaultInstanceIndex = i
-                break
-
-        if self.defaultInstanceIndex is None:
-            sys.exit('could not find named instance for default location')
-
-        # Put (unnamed) default instance first
+        # Add name map
         self.shortNames = [None]
-        for i, f in enumerate(self.fonts):
-            if i == self.defaultIndex:
-                continue
-            elif SHORTINSTNAMEKEY in f.lib:
+        for f in self.fonts[1:]:
+            if SHORTINSTNAMEKEY in f.lib:
                 self.shortNames.append(f.lib[SHORTINSTNAMEKEY])
             else:
-                self.shortNames.append(self.make_short_name(dsDoc, i))
+                self.shortNames.append(self.make_short_name(dsDoc,
+                                                            f.sourceIndex))
 
         self.base_names = {}
         self.dsDoc = dsDoc
@@ -408,7 +402,7 @@ class DesignspaceMarkAdapter(MarkAdapter):
 
     def anchor_glyphs(self):
         d = {}
-        f = self.fonts[self.defaultIndex]
+        f = self.fonts[0]
         for g in f:
             position_map = {}
             for a in g.anchors:
@@ -418,11 +412,10 @@ class DesignspaceMarkAdapter(MarkAdapter):
             anchorNameSet = set(position_map.keys())
             ni = 0
             for i, source in enumerate(self.fonts):
-                if i == self.defaultIndex:
+                if i == 0:
                     continue
-                ni += 1
                 # If the glyph is absent put NONEPOS as the position
-                if g.name not in f:
+                if g.name not in source:
                     for plist in position_map.values():
                         postions.append(NONEPOS)
                     continue
@@ -430,18 +423,18 @@ class DesignspaceMarkAdapter(MarkAdapter):
                 for sga in source[g.name].anchors:
                     if sga.name not in anchorNameSet:
                         sys.exit(f'Error: glyph {g.name} has anchor {a.name} '
-                                f'in source of instance {self.shortNames[ni]} '
+                                f'in source of instance {self.shortNames[i]} '
                                 'but not in source of default instance')
                     else:
                         plist = position_map[sga.name]
                         plist.append((round(sga.x), round(sga.y)))
                         foundNameSet.add(sga.name)
-            missingNames = anchorNameSet - foundNameSet
-            if missingNames:
-                mnamestr = ', '.join(missingNames)
-                sys.exit(f'Error: glyph {g.name} has anchors {mnamestr} '
-                        'in source of default instance but not '
-                        f'source of instance {self.shortNames[ni]}')
+                missingNames = anchorNameSet - foundNameSet
+                if missingNames:
+                    mnamestr = ', '.join(missingNames)
+                    sys.exit(f'Error: glyph {g.name} has anchors {mnamestr} '
+                             'in source of default instance but not '
+                             f'source of instance {self.shortNames[i]}')
             anchor_list = [AnchorInfo(a.name, tuple(position_map[a.name]))
                            for a in g.anchors]
             d[g.name] = GlyphAnchorInfo(g.name, g.width, anchor_list)
@@ -450,7 +443,7 @@ class DesignspaceMarkAdapter(MarkAdapter):
     def glyph_order(self):
         # Use the glyph ordering in the source for the default instance
         # as that should (always?) have all the glyphs
-        f = self.fonts[self.defaultIndex]
+        f = self.fonts[0]
         return {gn: i for (i, gn)
                 in enumerate(f.lib['public.glyphOrder'])}
 
