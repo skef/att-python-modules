@@ -382,10 +382,11 @@ class DesignspaceMarkAdapter(MarkAdapter):
         if self.defaultInstanceIndex is None:
             sys.exit('could not find named instance for default location')
 
-        self.shortNames = []
+        # Put (unnamed) default instance first
+        self.shortNames = [None]
         for i, f in enumerate(self.fonts):
             if i == self.defaultIndex:
-                self.shortNames.append(None)
+                continue
             elif SHORTINSTNAMEKEY in f.lib:
                 self.shortNames.append(f.lib[SHORTINSTNAMEKEY])
             else:
@@ -415,9 +416,11 @@ class DesignspaceMarkAdapter(MarkAdapter):
                 # position sorting groups those together
                 position_map[a.name] = [(round(a.x), round(a.y))]
             anchorNameSet = set(position_map.keys())
+            ni = 0
             for i, source in enumerate(self.fonts):
                 if i == self.defaultIndex:
                     continue
+                ni += 1
                 # If the glyph is absent put NONEPOS as the position
                 if g.name not in f:
                     for plist in position_map.values():
@@ -427,7 +430,7 @@ class DesignspaceMarkAdapter(MarkAdapter):
                 for sga in source[g.name].anchors:
                     if sga.name not in anchorNameSet:
                         sys.exit(f'Error: glyph {g.name} has anchor {a.name} '
-                                f'in source of instance {self.shortNames[i]} '
+                                f'in source of instance {self.shortNames[ni]} '
                                 'but not in source of default instance')
                     else:
                         plist = position_map[sga.name]
@@ -438,7 +441,7 @@ class DesignspaceMarkAdapter(MarkAdapter):
                 mnamestr = ', '.join(missingNames)
                 sys.exit(f'Error: glyph {g.name} has anchors {mnamestr} '
                         'in source of default instance but not '
-                        f'source of instance {self.shortNames[i]}')
+                        f'source of instance {self.shortNames[ni]}')
             anchor_list = [AnchorInfo(a.name, tuple(position_map[a.name]))
                            for a in g.anchors]
             d[g.name] = GlyphAnchorInfo(g.name, g.width, anchor_list)
@@ -509,12 +512,12 @@ class DesignspaceMarkAdapter(MarkAdapter):
         assert len(position) == len(self.fonts)
         def_pos = position[0]
         def_str = str(def_pos[0]) + ' ' + str(def_pos[1])
-        if all(p == NONEPOS or p == def_pos for p in position):
+        if all(p == NONEPOS or p == def_pos for p in position[1:]):
             return def_str
 
         pos_strs = ['<' + def_str + '>']
         for i, p in enumerate(position):
-            if i == self.defaultIndex or p == NONEPOS:
+            if i == 0 or p == NONEPOS:
                 continue
             pos_strs.append('@' + self.shortNames[i] + ':<' +
                             str(p[0]) + ' ' + str(p[1]) + '>')
