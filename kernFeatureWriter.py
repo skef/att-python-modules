@@ -381,11 +381,11 @@ class DesignspaceKernAdapter(KernAdapter):
         location = source.location
         anames = []
         for an in dsDoc.getAxisOrder():
-            avstr = "%g" % location[an]
+            avstr = "%c%g" % (an[0], location[an])
             avstr = avstr.replace('.', 'p')
             avstr = avstr.replace('-', 'n')
             anames.append(avstr)
-        return 'a' + '_'.join(anames)
+        return '_'.join(anames)
 
 
     def calc_glyph_data(self):

@@ -389,12 +389,13 @@ class DesignspaceMarkAdapter(MarkAdapter):
         self.base_names = {}
         self.dsDoc = dsDoc
 
+    # Must match function in kernFeatureWriter, which writes locations.fea
     def make_short_name(self, dsDoc, sourceIndex):
         source = dsDoc.sources[sourceIndex]
         location = source.location
         anames = []
         for an in dsDoc.getAxisOrder():
-            avstr = "%g" % location[an]
+            avstr = "%c%g" % (an[0], location[an])
             avstr = avstr.replace('.', 'p')
             avstr = avstr.replace('-', 'n')
             anames.append(avstr)
